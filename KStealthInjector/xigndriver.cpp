@@ -1,10 +1,11 @@
 #include "xigndriver.h"
+#include "driver_bin.h"
 
 namespace xigndriver
 {
 	void initialize()
 	{
-		service::start_service("C:\\Windows\\System32\\RepulsiveDriver.sys", "RepulsiveDriver");
+		service::start_service("C:\\Windows\\System32\\iutwfsitabnsahbsogiwbiwslhf.sys", "iutwfsitabnsahbsogiwbiwslhf");
 	}
 
 	HANDLE open_process(std::string process_name)
@@ -31,7 +32,7 @@ namespace xigndriver
 		request->access_mode = PROCESS_ALL_ACCESS;
 		request->output = (uint64_t)response;
 
-		auto hDriver = service::get_handle("RepulsiveDriver");
+		auto hDriver = service::get_handle("iutwfsitabnsahbsogiwbiwslhf");
 		if (!WriteFile(hDriver, request, sizeof(xign_packet), &bytes_written, NULL)) {
 			printf("Driver Write Failed: %d\n", GetLastError());
 			return NULL;

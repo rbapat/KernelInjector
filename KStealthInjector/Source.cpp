@@ -1,17 +1,11 @@
 #include <Windows.h>
 #include <iostream>
 
-#include "service.h"
 #include "process.h"
-#include "xigndriver.h"
-
+#include "mapper.h"
 
 int main()
-{	
-	xigndriver::initialize();
-
-	TerminateProcess(xigndriver::open_process("Engine.exe"), 1);
-
-	getchar();
+{
+	mapper::inject("ToInject.dll", "Target.exe");
 	return 0;
 }
