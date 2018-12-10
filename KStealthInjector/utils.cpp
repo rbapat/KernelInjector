@@ -2,11 +2,11 @@
 
 namespace utils
 {
-	LPVOID read_file(std::string file_path)
+	LPVOID read_file(const char *file_path)
 	{
 		DWORD dwBytesRead;
 
-		auto hFile = CreateFileA(file_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, NULL, NULL);
+		auto hFile = CreateFileA(file_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, NULL, NULL);
 		if ((HANDLE)hFile == INVALID_HANDLE_VALUE)
 		{
 			printf("Unable to CreateFile %s: %d\n", file_path, GetLastError());

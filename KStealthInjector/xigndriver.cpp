@@ -23,6 +23,7 @@ namespace xigndriver
 		xign_response *response = new xign_response();
 		
 		DWORD bytes_written;
+		HANDLE hTarget;
 
 		request->size = 0x270;
 		request->magic_num = 0x345821AB;
@@ -33,11 +34,15 @@ namespace xigndriver
 		request->output = (uint64_t)response;
 
 		auto hDriver = service::get_handle("iutwfsitabnsahbsogiwbiwslhf");
+		
 		if (!WriteFile(hDriver, request, sizeof(xign_packet), &bytes_written, NULL)) {
 			printf("Driver Write Failed: %d\n", GetLastError());
-			return NULL;
+			hTarget = NULL;
 		}
 
-		return response->process_handle;
+		hTarget = response->process_handle;
+
+		CloseHandle(hDriver);
+		return hTarget;
 	}
 }

@@ -2,7 +2,7 @@
 
 namespace service
 {
-	std::uint32_t start_service(std::string driver_path, std::string service_name)
+	std::uint64_t start_service(std::string driver_path, std::string service_name)
 	{
 		if (service::running(service_name))
 			return 1;
@@ -120,7 +120,7 @@ namespace service
 		sprintf_s(driver_path, "\\\\.\\%s", service_name.c_str());
 		return CreateFile(driver_path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	}
-	std::uint32_t kill_service(std::string service_name)
+	std::uint64_t kill_service(std::string service_name)
 	{
 		if (service::exists(service_name))
 		{

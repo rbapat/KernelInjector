@@ -6,6 +6,7 @@
 
 int main()
 {
-	mapper::inject("ToInject.dll", "Target.exe");
+	mapper::inject("FortniteLauncher.exe", "C:\\payload64.dll");
+	getchar();
 	return 0;
 }

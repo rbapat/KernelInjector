@@ -2,220 +2,304 @@
 
 namespace mapper
 {
-	PBYTE inject(std::string target_dll, std::string target_exe)
+	std::vector<module_info> module_list;
+	LPCSTR vuln_module = "kernel32.dll", vuln_function = "TlsSetValue";
+
+	PVOID inject(std::string target_proc, std::string dll)
 	{
 		xigndriver::initialize();
-		printf("Getting target PID...\n");
 
-		auto target_id = process::get_process_id(target_exe);
-		while (!target_id)
-			target_id = process::get_process_id(target_exe);
+		auto target_pid = process::get_process_id(target_proc);
+		while (!target_pid)
+			target_pid = process::get_process_id(target_proc);
 
-		Sleep(500);
-
-		printf("%s: %d\n", target_exe.c_str(), target_id);
-		auto target_handle = xigndriver::open_process(target_exe);/*OpenProcess(PROCESS_ALL_ACCESS, NULL, target_id);//*/
-
+		auto target_handle = xigndriver::open_process(target_proc);
+		printf("%x\n", target_handle);
+		
 		if (target_handle)
 		{
-			auto imported_modules = process::get_imported_modules(target_id);
-			return inject_ex(target_handle, target_dll, imported_modules);
+			auto image_base = inject_ex(target_handle, target_proc, dll);
+			if (image_base)
+				return image_base;
+			else
+				printf("Error injecting %s into %s", dll.c_str(), target_proc.c_str());
 		}
 		else
 		{
-			printf("Unable to open target handle: %d\n", GetLastError());
-			return NULL;
+			printf("Error %X acquiring handle to %X-%s\n", GetLastError(), target_pid, target_proc.c_str());
 		}
 
 		return NULL;
-
 	}
 
-	PBYTE inject_ex(HANDLE target_handle, std::string dll_name, std::map<std::string, uint32_t> &imported_modules)
+	PVOID inject_ex(HANDLE target_handle, std::string target_proc, std::string dll)
 	{
-		printf("Mapping %s into target\n", dll_name.c_str());
-
-		auto local_image = utils::read_file(dll_name);
+		auto local_image = utils::read_file(dll.c_str());
 
 		auto dosHeader = (PIMAGE_DOS_HEADER)local_image;
-		auto ntHeaders = (PIMAGE_NT_HEADERS)((uint32_t)local_image + dosHeader->e_lfanew);
+		auto ntHeaders = (PIMAGE_NT_HEADERS)((uint64_t)local_image + dosHeader->e_lfanew);
 		auto sectHeader = (PIMAGE_SECTION_HEADER)(&ntHeaders->OptionalHeader + 1);
 
-		auto target_image = VirtualAlloc(NULL, ntHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		auto fixed_image = VirtualAlloc(NULL, ntHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 		auto target_mem = VirtualAllocEx(target_handle, NULL, ntHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
-		if (target_image && target_mem)
+		if (fixed_image && target_mem)
 		{
-			mapper::copy_sections(target_handle, local_image, target_image);
+			mapper::copy_sections(local_image, fixed_image);
+			mapper::relocate_base(fixed_image, target_mem);
+			mapper::fix_imports(target_handle, fixed_image, target_proc);
 
-			mapper::relocate_base(target_image, target_mem);
-
-			mapper::fix_imports(target_handle, target_image, imported_modules);
-
-			if (!WriteProcessMemory(target_handle, target_mem, target_image, ntHeaders->OptionalHeader.SizeOfImage, NULL))
+			if (!WriteProcessMemory(target_handle, target_mem, fixed_image, ntHeaders->OptionalHeader.SizeOfImage, NULL))
 			{
-				printf("Unable to write relocated image to target image: %d\n", GetLastError());
-				VirtualFree(target_image, NULL, MEM_RELEASE);
+				printf("Unable to write relocated image to target image: %X\n", GetLastError());
+				VirtualFree(fixed_image, NULL, MEM_RELEASE);
 				VirtualFree(local_image, NULL, MEM_RELEASE);
 				VirtualFreeEx(target_handle, target_mem, NULL, MEM_RELEASE);
 				return 0;
 			}
-			uint32_t size = abs((int)((uint32_t)mapper::LoadDll - (uint32_t)mapper::LoadDllEnd));
 
-			if (process::inject_function(target_handle, size, (LPVOID)mapper::LoadDll, (LPVOID)target_mem))
+			mapper::call_entrypoint(target_handle, target_mem, fixed_image);
+
+			return target_mem;
+		}
+		else
+		{
+			printf("Unable to allocate memory for image (local: %X, remote: %X)\n", fixed_image, target_mem);
+		}
+
+		return NULL;
+
+	}
+
+	void copy_sections(LPVOID local_image, LPVOID fixed_image)
+	{
+		auto dos_header = (PIMAGE_DOS_HEADER)local_image;
+		auto nt_headers = (PIMAGE_NT_HEADERS)((uint64_t)local_image + dos_header->e_lfanew);
+		auto sect_header = (PIMAGE_SECTION_HEADER)(&nt_headers->OptionalHeader + 1);
+
+		memcpy(fixed_image, local_image, nt_headers->OptionalHeader.SizeOfHeaders);
+		for (auto count = 0; count < nt_headers->FileHeader.NumberOfSections; count++)
+		{
+
+			memcpy((PBYTE)fixed_image + sect_header[count].VirtualAddress, (PBYTE)local_image + sect_header[count].PointerToRawData, sect_header[count].SizeOfRawData);
+		}
+	}
+
+	void relocate_base(LPVOID fixed_image, LPVOID target_mem)
+	{
+		auto nt_headers = (PIMAGE_NT_HEADERS)((LPBYTE)fixed_image + ((PIMAGE_DOS_HEADER)fixed_image)->e_lfanew);
+		auto base_reloc = (PIMAGE_BASE_RELOCATION)((LPBYTE)fixed_image + nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+		auto delta = (uint64_t)((LPBYTE)target_mem - nt_headers->OptionalHeader.ImageBase);
+
+		for (; base_reloc->VirtualAddress; base_reloc = (PIMAGE_BASE_RELOCATION)((PBYTE)base_reloc + base_reloc->SizeOfBlock))
+		{
+			auto relocs = (relocation *)(base_reloc + 1);
+
+			for (int x = 0; x < (base_reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD); x++)
 			{
-				printf("Manual Mapped %s\n", dll_name.c_str());
+				switch (relocs[x].type)
+				{
+				case IMAGE_REL_BASED_DIR64:
+					*(uint64_t *)((LPBYTE)fixed_image + (base_reloc->VirtualAddress + relocs[x].offset)) += delta;
+					break;
 
-				char *tmp = (char *)VirtualAlloc(NULL, MAX_PATH, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-				tmp = PathFindFileName(dll_name.c_str());
-				imported_modules.insert(std::make_pair(tmp, (uint32_t)target_mem));
-				return (PBYTE)target_mem;
+				case IMAGE_REL_BASED_HIGHLOW:
+					*(uint32_t *)((LPBYTE)fixed_image + (base_reloc->VirtualAddress + relocs[x].offset)) += (uint32_t)delta;
+					break;
+
+				case IMAGE_REL_BASED_HIGH:
+					*(uint16_t *)((LPBYTE)fixed_image + (base_reloc->VirtualAddress + relocs[x].offset)) += HIWORD(delta);
+					break;
+
+				case IMAGE_REL_BASED_LOW:
+					*(uint16_t *)((LPBYTE)fixed_image + (base_reloc->VirtualAddress + relocs[x].offset)) += LOWORD(delta);
+					break;
+
+				case IMAGE_REL_BASED_ABSOLUTE:
+					break;
+
+				default:
+					printf("Unable to catch relocation type %X", relocs[x].type);
+					break;
+				}
 			}
-			else
+		}
+	}
+
+	void fix_imports(HANDLE target_handle, LPVOID fixed_image, std::string target_process)
+	{
+		auto nt_headers = (PIMAGE_NT_HEADERS)((LPBYTE)fixed_image + ((PIMAGE_DOS_HEADER)fixed_image)->e_lfanew);
+		auto import_desc = (PIMAGE_IMPORT_DESCRIPTOR)((LPBYTE)fixed_image + nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+		if (import_desc)
+		{
+			for (; import_desc->Name; import_desc++)
 			{
-				printf("Unable to inject loader into target memory: %d\n", GetLastError());
-				CloseHandle(target_handle);
-				VirtualFree(target_image, NULL, MEM_RELEASE);
-				VirtualFree(target_mem, NULL, MEM_RELEASE);
-				VirtualFree(local_image, NULL, MEM_RELEASE);
-				return NULL;
+				module_info dependency = mapper::get_dependency(fixed_image, import_desc);
+				auto remote_base = process::get_remote_module(GetProcessId(target_handle), dependency.dll_name);
+				if (!remote_base)
+				{
+					for (auto module : module_list)
+					{
+						if (!_strcmpi(module.dll_name, dependency.dll_name))
+							remote_base = (PBYTE)module.base_address;
+					}
+
+					if (!remote_base)
+					{
+						remote_base = (PBYTE)inject_ex(target_handle, target_process, dependency.full_path_name);
+					}
+				}
+
+				if (remote_base)
+				{
+					auto _thunk_data = (PIMAGE_THUNK_DATA)((uint64_t)fixed_image + import_desc->FirstThunk);
+					auto thunk_data = (PIMAGE_THUNK_DATA)((uint64_t)fixed_image + import_desc->OriginalFirstThunk);
+
+					for (; thunk_data->u1.Function != NULL; thunk_data++, _thunk_data++)
+					{
+						auto import_name = (PIMAGE_IMPORT_BY_NAME)((uint64_t)fixed_image + thunk_data->u1.AddressOfData);
+						_thunk_data->u1.Function = (uint64_t)((uint64_t)GetProcAddress((HMODULE)dependency.base_address, import_name->Name) + (remote_base - dependency.base_address));
+					}
+				}
+
 			}
 		}
 		else
 		{
-			printf("Unable to allocate target memory: %d\n", GetLastError());
-			CloseHandle(target_handle);
-			if (target_image) VirtualFree(target_image, NULL, MEM_RELEASE);
-			VirtualFree(local_image, NULL, MEM_RELEASE);
-			return NULL;
+			printf("Unable to locate import descriptor\n");
 		}
 	}
 
-	void copy_sections(HANDLE target_handle, LPVOID local_image, LPVOID target_image)
+	module_info get_dependency(LPVOID fixed_image, PIMAGE_IMPORT_DESCRIPTOR import_desc)
 	{
-		auto dos_header = (PIMAGE_DOS_HEADER)local_image;
-		auto nt_headers = (PIMAGE_NT_HEADERS32)((uint32_t)local_image + dos_header->e_lfanew);
-		auto sect_header = (PIMAGE_SECTION_HEADER)(&nt_headers->OptionalHeader + 1);
-
-		memcpy(target_image, local_image, nt_headers->OptionalHeader.SizeOfHeaders);
-		for (auto count = 0; count < nt_headers->FileHeader.NumberOfSections; count++)
-		{
-
-			memcpy((PBYTE)target_image + sect_header[count].VirtualAddress, (PBYTE)local_image + sect_header[count].PointerToRawData, sect_header[count].SizeOfRawData);
-		}
+		auto dependency_base = LoadLibrary((char *)((PBYTE)fixed_image + import_desc->Name));
+		char dependency_path[MAX_PATH];
+		GetModuleFileNameA(dependency_base, dependency_path, MAX_PATH);
+		auto dependency_name = PathFindFileNameA(dependency_path);
+		return { dependency_path, dependency_name, dependency_base };
 	}
 
-	void relocate_base(LPVOID target_image, LPVOID target_mem)
+	void call_entrypoint(HANDLE target_handle, PVOID target_mem, PVOID fixed_image)
 	{
-		auto nt_headers = (PIMAGE_NT_HEADERS32)((LPBYTE)target_image + ((PIMAGE_DOS_HEADER)target_image)->e_lfanew);
-		auto pIBR = (PIMAGE_BASE_RELOCATION)((LPBYTE)target_image + nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-		auto delta = (DWORD)((LPBYTE)target_mem - nt_headers->OptionalHeader.ImageBase);
-		while (pIBR->VirtualAddress)
+		DWORD funcProt, caveProt;
+
+		uint8_t shellcode[] = {
+			0x9C,															//pushfq
+			0x50,															//push rax
+			0x53,															//push rbx
+			0x51,															//push rcx
+			0x52,															//push rdx
+			0x41, 0x50,														//push r8
+			0x41, 0x51,														//push r9
+			0x41, 0x52,														//push r10
+			0x41, 0x53,														//push r11
+			0x55,															//push rbp
+			0x48, 0x89, 0xE5,												//mov rbp, rsp
+			0x48, 0x83, 0xE4, 0xF0,											//and rsp, 0xFFFFFFFFFFFFFFF7
+			0x48, 0xB9, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,		//mov rcx, 0xCCCCCCCCCCCCCCCC
+			0xC7, 0x01, 0x56, 0x02, 0x00, 0x00,								//mov dword ptr ds:[rcx], 0x256
+			0x4D, 0x33, 0xC0,												//xor r8, r8
+			0xBA, 0x01, 0x00, 0x00, 0x00,									//mov edx, 0x1
+			0x51,															//push rcx
+			0x48, 0xBB, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,		//mov rbx, 0xCCCCCCCCCCCCCCCC
+			0x48, 0x81, 0xEC, 0x08, 0x02, 0x00, 0x00,						//sub rsp, 208
+			0xFF, 0xD3,														//call rbx
+			0x48, 0x81, 0xC4, 0x08, 0x02, 0x00, 0x00,						//add rsp, 208
+			0x59,															//pop rcx
+			0xC7, 0x01, 0x63, 0x02, 0x00, 0x00,								//mov dword ptr ds:[rcx], 0x263
+			0x48, 0x89, 0xEC,												//mov rsp, rbp
+			0x5D,															//pop rbp
+			0x41, 0x5B,														//pop r11
+			0x41, 0x5A,														//pop r10
+			0x41, 0x59,														//pop r9
+			0x41, 0x58,														//pop r8
+			0x5A,															//pop rdx
+			0x59,															//pop rcx
+			0x5B,															//pop rbx
+			0x58,															//pop rax
+			0x9D,															//popfq
+			0x48, 0xB8, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,		//mov rax, 0xCCCCCCCCCCCCCCCC
+			0xFF, 0xE0														//jmp rax
+		};
+
+		auto codecave = (PVOID)PE::find_code_cave(LoadLibrary("kernel32.dll"), sizeof(shellcode));
+		auto target_function = PE::get_exported_function(vuln_module, vuln_function);
+		auto entry_point = (PBYTE)target_mem + PE::get_entrypoint_offset(fixed_image);
+
+		*(uint64_t *)(shellcode + 23) = (uint64_t)target_mem;
+		*(uint64_t *)(shellcode + 48) = (uint64_t)entry_point;
+		*(uint64_t *)(shellcode + 98) = (uint64_t)target_function;
+
+		if (target_function && codecave)
 		{
-			if (pIBR->SizeOfBlock >= sizeof(IMAGE_BASE_RELOCATION))
+			if (VirtualProtectEx(target_handle, target_function, sizeof(ULONGLONG), PAGE_EXECUTE_READWRITE, &funcProt) && VirtualProtectEx(target_handle, codecave, sizeof(shellcode), PAGE_EXECUTE_READWRITE, &caveProt))
 			{
-				auto count = (pIBR->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-				auto list = (PWORD)(pIBR + 1);
+				uint64_t overwritten_bytes;
 
-				for (auto i = 0; i < count; i++)
+				auto success = ReadProcessMemory(target_handle, target_function, &overwritten_bytes, sizeof(uint64_t), NULL);
+				success &= WriteProcessMemory(target_handle, codecave, &shellcode, sizeof(shellcode), NULL);
+				if (!success)
 				{
-					if (list[i])
-					{
-						auto ptr = (PDWORD)((LPBYTE)target_image + (pIBR->VirtualAddress + (list[i] & 0xFFF)));
-						*ptr += delta;
-					}
+					printf("Unable to read vulnerable function or write shellcode: %X\n", GetLastError());
 				}
+
+				uint8_t *jmp = shellcode::relative_jmp_64((PBYTE)codecave - target_function - 5);
+				WriteProcessMemory(target_handle, target_function, jmp, sizeof(ULONGLONG), NULL);
+
+				mapper::wait_for_exit(target_handle, target_mem, target_function, overwritten_bytes);
+
+				mapper::post_injection(target_handle, target_mem, codecave);
+
+				VirtualProtectEx(target_handle, target_function, sizeof(ULONGLONG), funcProt, &funcProt);
+				VirtualProtectEx(target_handle, codecave, sizeof(shellcode), caveProt, &caveProt);
 			}
-
-			pIBR = (PIMAGE_BASE_RELOCATION)((LPBYTE)pIBR + pIBR->SizeOfBlock);
-		}
-
-		/*
-		auto nt_headers = (PIMAGE_NT_HEADERS32)((LPBYTE)target_image + ((PIMAGE_DOS_HEADER)target_image)->e_lfanew);
-
-		auto base_reloc = (PIMAGE_BASE_RELOCATION)((LPBYTE)target_image + nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-
-		for (; base_reloc->VirtualAddress; base_reloc = (PIMAGE_BASE_RELOCATION)((PBYTE)base_reloc + base_reloc->SizeOfBlock))
-		{
-			auto first_reloc = (PWORD)((PBYTE)base_reloc + sizeof(IMAGE_BASE_RELOCATION));
-			for (auto x = 0; x < (base_reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD); x++)
+			else
 			{
-				auto reloc_address = (PBYTE)target_image + base_reloc->VirtualAddress + (first_reloc[x] & 0xFFF);
-				switch (*first_reloc >> 12)
-				{
-
-				case IMAGE_REL_BASED_HIGHLOW:
-					*reloc_address += (uint32_t)((PBYTE)target_mem - nt_headers->OptionalHeader.ImageBase);
-					break;
-
-				case IMAGE_REL_BASED_DIR64:
-					*(uint64_t *)reloc_address += ((uint64_t)target_mem - nt_headers->OptionalHeader.ImageBase);
-					break;
-
-				default:
-					printf("Didnt catch relocation: %d\n", *first_reloc >> 12);
-					break;
-				}
+				printf("Unable to gain access codecave or target function: %X\n", GetLastError());
 			}
-		}*/
+		}
+		else
+		{
+			printf("Unable to find codecave or target function: %s:%llx, %s:%llx\n", vuln_module, codecave, vuln_function, target_function);
+		}
 	}
 
-	void fix_imports(HANDLE target_handle, LPVOID target_image, std::map<std::string, uint32_t> &imported_modules)
+	void wait_for_exit(HANDLE target_handle, PVOID target_mem, PVOID function_address, uint64_t overwritten_bytes)
 	{
-		auto nt_headers = (PIMAGE_NT_HEADERS)((LPBYTE)target_image + ((PIMAGE_DOS_HEADER)target_image)->e_lfanew);
-		auto import_desc = (PIMAGE_IMPORT_DESCRIPTOR)((LPBYTE)target_image + nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-		char *module_name = (char *)VirtualAlloc(NULL, MAX_PATH, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-		for (; import_desc->Name; import_desc++)
+		USHORT injection_status;
+		bool function_restored = false;
+		while (ReadProcessMemory(target_handle, target_mem, &injection_status, 2, NULL))
 		{
-			ZeroMemory(module_name, MAX_PATH);
-			HMODULE loadee_base = LoadLibrary((LPCSTR)((uint32_t)target_image + import_desc->Name));
-			GetModuleFileNameA(loadee_base, module_name, MAX_PATH);
-
-			auto base_addr = mapper::contains(imported_modules, module_name);
-			if(!base_addr)
-				base_addr = (uint32_t)mapper::inject_ex(target_handle, module_name, imported_modules);
-
-			auto _thunk_data = (PIMAGE_THUNK_DATA)((uint32_t)target_image + import_desc->FirstThunk);
-			auto thunk_data = (PIMAGE_THUNK_DATA)((uint32_t)target_image + import_desc->OriginalFirstThunk);
-
-			for(; thunk_data->u1.Function != NULL; thunk_data++, _thunk_data++)
+			if (injection_status == RESTORE_FUNCTION && !function_restored)
 			{
-				auto import_name = (PIMAGE_IMPORT_BY_NAME)((uint32_t)target_image + thunk_data->u1.AddressOfData);
-				_thunk_data->u1.Function = (uint32_t)GetProcAddress(loadee_base, import_name->Name) + (imported_modules.find(module_name)->second - (uint32_t)GetModuleHandle(module_name));
+				WriteProcessMemory(target_handle, function_address, &overwritten_bytes, sizeof(uint64_t), NULL);
+				function_restored = true;
 			}
+			if (injection_status == INJECTION_SUCCESS)
+			{
+				if (!function_restored)
+					WriteProcessMemory(target_handle, function_address, &overwritten_bytes, sizeof(uint64_t), NULL);
+				break;
+			}
+
 		}
 	}
 
-	uint32_t contains(std::map<std::string, uint32_t> imported_modules, LPCSTR module_name)
+	void post_injection(HANDLE target_handle, PVOID target_mem, PVOID codecave)
 	{
-
-		std::map<std::string, uint32_t>::iterator it = imported_modules.begin();
-		while (it != imported_modules.end())
+		auto zero_mem = VirtualAlloc(NULL, sizeof(codecave), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+		if (zero_mem)
 		{
-			if (!_stricmp(it->first.c_str(), module_name))
-				return it->second;
-			it++;
+			RtlZeroMemory(zero_mem, sizeof(codecave));
+			WriteProcessMemory(target_handle, codecave, &zero_mem, sizeof(codecave), NULL);
+			WriteProcessMemory(target_handle, target_mem, &codecave, 4096, NULL);
+
+			VirtualFree(zero_mem, NULL, MEM_RELEASE);
 		}
-
-		return NULL;
-	}
-
-
-	uint32_t LoadDll(LPVOID targetImage)
-	{
-		
-		typedef BOOL(WINAPI *DllMainStub)(HINSTANCE, DWORD, LPVOID);
-		auto dosHeader = (PIMAGE_DOS_HEADER)targetImage;
-		auto ntHeaders = (PIMAGE_NT_HEADERS32)((uint32_t)targetImage + dosHeader->e_lfanew);
-
-		if (ntHeaders->OptionalHeader.AddressOfEntryPoint)
+		else
 		{
-			auto oep = (DllMainStub)((PBYTE)targetImage + ntHeaders->OptionalHeader.AddressOfEntryPoint);		
-			oep((HMODULE)targetImage, DLL_PROCESS_ATTACH, NULL);
-
+			printf("Unable to allocate buffer to zero codecave: %X\n", GetLastError());
 		}
-		return 1;
 	}
-
-	void LoadDllEnd() {}
 }

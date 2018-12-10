@@ -1,17 +1,12 @@
 #pragma once
 #include <Windows.h>
 #include <iostream>
-#include <string>
 #include <TlHelp32.h>
-#include <map>
-
-#include "xigndriver.h"
+#include <string>
 
 namespace process
 {
-	uint32_t get_process_id(std::string process_name);
-	HANDLE get_target_handle(uint32_t target_pid);
-	std::map<std::string, uint32_t> get_imported_modules(uint32_t target_process);
-	uint32_t inject_function(HANDLE target_handle, uint32_t stub_size, LPVOID loader_stub, LPVOID lpParams);
-
+	uint64_t get_process_id(std::string process_name);
+	HANDLE get_vulnerable_thread(HANDLE process_handle);
+	PBYTE get_remote_module(uint64_t target_pid, LPCSTR module_name);
 }
